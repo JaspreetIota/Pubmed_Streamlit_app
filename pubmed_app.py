@@ -9,6 +9,13 @@ import feedparser
 import urllib.parse
 from zipfile import ZipFile
 
+try:
+    import fitz  # PyMuPDF
+    from pptx import Presentation
+except ImportError:
+    fitz = None
+    Presentation = None
+
 # ---------- CONFIG ----------
 Entrez.email = "your_email@example.com"  # Replace with your actual email
 logging.basicConfig(level=logging.INFO)
@@ -62,6 +69,53 @@ def get_google_news(query, max_articles=5):
         })
     return news
 
+def convert_pdf_to_ppt(pdf_bytes, render_scale=2.0):
+    """Convert PDF pages to full-slide images in a PowerPoint presentation."""
+    if fitz is None or Presentation is None:
+        raise RuntimeError("Install PyMuPDF and python-pptx to use this tool.")
+
+    pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
+    if pdf_document.page_count == 0:
+        pdf_document.close()
+        raise ValueError("The uploaded PDF contains no pages.")
+
+    presentation = Presentation()
+    presentation.slide_width = 13_333_333
+    presentation.slide_height = 7_500_000
+    blank_layout = presentation.slide_layouts[6]
+
+    try:
+        for page in pdf_document:
+            pixmap = page.get_pixmap(
+                matrix=fitz.Matrix(render_scale, render_scale), alpha=False
+            )
+            image_buffer = BytesIO(pixmap.tobytes("png"))
+            slide = presentation.slides.add_slide(blank_layout)
+            page_ratio = pixmap.width / pixmap.height
+            slide_ratio = presentation.slide_width / presentation.slide_height
+
+            if page_ratio > slide_ratio:
+                image_width = presentation.slide_width
+                image_height = int(image_width / page_ratio)
+                left = 0
+                top = int((presentation.slide_height - image_height) / 2)
+            else:
+                image_height = presentation.slide_height
+                image_width = int(image_height * page_ratio)
+                left = int((presentation.slide_width - image_width) / 2)
+                top = 0
+
+            slide.shapes.add_picture(
+                image_buffer, left, top, width=image_width, height=image_height
+            )
+    finally:
+        pdf_document.close()
+
+    output = BytesIO()
+    presentation.save(output)
+    output.seek(0)
+    return output
+
 # ---------- STREAMLIT UI ----------
 st.set_page_config(page_title="IOTA Tools", layout="wide")
 
@@ -73,7 +127,8 @@ menu = st.sidebar.selectbox("🔍 Select Tool", [
     "Excel Merger-Flatten Viewer",
     "Fuzzy Name Matcher",
     "Categories Lister",
-    "Patent Scraper"   # ✅ NEW TOOL
+    "Patent Scraper",
+    "PDF to PowerPoint"
 ])
 # ==========================
 # 🚀 PubMed Article Extractor
@@ -608,6 +663,50 @@ elif menu == "Categories Lister":
 
         except Exception as e:
             st.error(f"❌ Failed to process file: {e}")
+
+# ===============================
+# PDF to PowerPoint
+# ===============================
+elif menu == "PDF to PowerPoint":
+    st.title("PDF to PowerPoint Converter")
+    st.markdown(
+        "Upload a PDF to create a PowerPoint with one PDF page per slide. "
+        "The original page layout is preserved as an image."
+    )
+
+    uploaded_pdf = st.file_uploader("Upload PDF", type=["pdf"])
+    quality = st.select_slider(
+        "Rendering quality",
+        options=["Standard", "High"],
+        value="High",
+        help="High quality produces a larger PowerPoint file."
+    )
+
+    if uploaded_pdf is not None:
+        st.info(f"Selected: {uploaded_pdf.name}")
+
+        if fitz is None or Presentation is None:
+            st.error(
+                "Required packages are not installed. Run: "
+                "`pip install PyMuPDF python-pptx`"
+            )
+        elif st.button("Convert to PowerPoint"):
+            try:
+                with st.spinner("Converting PDF pages to slides..."):
+                    scale = 1.5 if quality == "Standard" else 2.5
+                    ppt_buffer = convert_pdf_to_ppt(uploaded_pdf.getvalue(), scale)
+
+                output_name = re.sub(r"(?i)\.pdf$", "", uploaded_pdf.name) + ".pptx"
+                st.success("Conversion completed successfully.")
+                st.download_button(
+                    label="Download PowerPoint",
+                    data=ppt_buffer,
+                    file_name=output_name,
+                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                )
+            except Exception as e:
+                logging.exception("PDF to PowerPoint conversion failed")
+                st.error(f"Conversion failed: {e}")
 
 # ===============================
 # 📄 Patent Scraper
