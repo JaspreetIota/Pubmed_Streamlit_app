@@ -93,6 +93,8 @@ pytz==2024.1
 pywinpty==2.0.13
 PyYAML==6.0.1
 pyzmq==25.1.2
+PyMuPDF==1.26.4
+python-pptx==1.0.2
 referencing==0.35.1
 requests==2.32.3
 rfc3339-validator==0.1.4
