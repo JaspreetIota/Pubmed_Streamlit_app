@@ -12,9 +12,15 @@ from zipfile import ZipFile
 try:
     import fitz  # PyMuPDF
     from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.enum.text import MSO_AUTO_SIZE
+    from pptx.util import Pt
 except ImportError:
     fitz = None
     Presentation = None
+    RGBColor = None
+    MSO_AUTO_SIZE = None
+    Pt = None
 
 # ---------- CONFIG ----------
 Entrez.email = "your_email@example.com"  # Replace with your actual email
@@ -69,8 +75,8 @@ def get_google_news(query, max_articles=5):
         })
     return news
 
-def convert_pdf_to_ppt(pdf_bytes, render_scale=2.0):
-    """Convert PDF pages to full-slide images in a PowerPoint presentation."""
+def convert_pdf_to_ppt(pdf_bytes, editable=True, render_scale=2.0):
+    """Convert PDF pages to editable objects or full-slide images."""
     if fitz is None or Presentation is None:
         raise RuntimeError("Install PyMuPDF and python-pptx to use this tool.")
 
@@ -86,28 +92,92 @@ def convert_pdf_to_ppt(pdf_bytes, render_scale=2.0):
 
     try:
         for page in pdf_document:
-            pixmap = page.get_pixmap(
-                matrix=fitz.Matrix(render_scale, render_scale), alpha=False
-            )
-            image_buffer = BytesIO(pixmap.tobytes("png"))
             slide = presentation.slides.add_slide(blank_layout)
-            page_ratio = pixmap.width / pixmap.height
+            page_ratio = page.rect.width / page.rect.height
             slide_ratio = presentation.slide_width / presentation.slide_height
 
             if page_ratio > slide_ratio:
-                image_width = presentation.slide_width
-                image_height = int(image_width / page_ratio)
-                left = 0
-                top = int((presentation.slide_height - image_height) / 2)
+                content_width = presentation.slide_width
+                content_height = int(content_width / page_ratio)
+                offset_x = 0
+                offset_y = int((presentation.slide_height - content_height) / 2)
             else:
-                image_height = presentation.slide_height
-                image_width = int(image_height * page_ratio)
-                left = int((presentation.slide_width - image_width) / 2)
-                top = 0
+                content_height = presentation.slide_height
+                content_width = int(content_height * page_ratio)
+                offset_x = int((presentation.slide_width - content_width) / 2)
+                offset_y = 0
 
-            slide.shapes.add_picture(
-                image_buffer, left, top, width=image_width, height=image_height
-            )
+            scale_x = content_width / page.rect.width
+            scale_y = content_height / page.rect.height
+
+            if not editable:
+                pixmap = page.get_pixmap(
+                    matrix=fitz.Matrix(render_scale, render_scale), alpha=False
+                )
+                image_buffer = BytesIO(pixmap.tobytes("png"))
+                slide.shapes.add_picture(
+                    image_buffer, offset_x, offset_y,
+                    width=content_width, height=content_height
+                )
+                continue
+
+            # PDF text/image blocks are rebuilt as separate PowerPoint objects.
+            for block in page.get_text("dict").get("blocks", []):
+                if block.get("type") == 1 and block.get("image"):
+                    x0, y0, x1, y1 = block["bbox"]
+                    try:
+                        slide.shapes.add_picture(
+                            BytesIO(block["image"]),
+                            int(offset_x + x0 * scale_x),
+                            int(offset_y + y0 * scale_y),
+                            width=max(1, int((x1 - x0) * scale_x)),
+                            height=max(1, int((y1 - y0) * scale_y))
+                        )
+                    except Exception:
+                        logging.warning("Skipped an unsupported PDF image block")
+                    continue
+
+                if block.get("type") != 0:
+                    continue
+
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        text = span.get("text", "")
+                        if not text.strip():
+                            continue
+
+                        x0, y0, x1, y1 = span["bbox"]
+                        box = slide.shapes.add_textbox(
+                            int(offset_x + x0 * scale_x),
+                            int(offset_y + y0 * scale_y),
+                            max(1, int((x1 - x0) * scale_x * 1.08)),
+                            max(1, int((y1 - y0) * scale_y * 1.20))
+                        )
+                        frame = box.text_frame
+                        frame.clear()
+                        frame.margin_left = 0
+                        frame.margin_right = 0
+                        frame.margin_top = 0
+                        frame.margin_bottom = 0
+                        frame.word_wrap = False
+                        frame.auto_size = MSO_AUTO_SIZE.NONE
+                        run = frame.paragraphs[0].add_run()
+                        run.text = text
+                        font = run.font
+                        font.size = Pt(max(1, span.get("size", 10) * scale_y / 12700))
+                        font.bold = bool(span.get("flags", 0) & 16)
+                        font.italic = bool(span.get("flags", 0) & 2)
+
+                        font_name = span.get("font")
+                        if font_name:
+                            font.name = font_name.split("+")[-1]
+
+                        color = span.get("color", 0)
+                        font.color.rgb = RGBColor(
+                            (color >> 16) & 255,
+                            (color >> 8) & 255,
+                            color & 255
+                        )
     finally:
         pdf_document.close()
 
@@ -671,16 +741,27 @@ elif menu == "PDF to PowerPoint":
     st.title("PDF to PowerPoint Converter")
     st.markdown(
         "Upload a PDF to create a PowerPoint with one PDF page per slide. "
-        "The original page layout is preserved as an image."
+        "Editable mode reconstructs text and images as separate PowerPoint objects."
     )
 
     uploaded_pdf = st.file_uploader("Upload PDF", type=["pdf"])
-    quality = st.select_slider(
-        "Rendering quality",
-        options=["Standard", "High"],
-        value="High",
-        help="High quality produces a larger PowerPoint file."
+    conversion_mode = st.radio(
+        "Conversion mode",
+        ["Editable objects", "Exact appearance (page images)"],
+        index=0,
+        help=(
+            "Editable mode creates separate text boxes and images. Exact appearance "
+            "mode flattens each page and is not editable."
+        )
     )
+    quality = "High"
+    if conversion_mode == "Exact appearance (page images)":
+        quality = st.select_slider(
+            "Rendering quality",
+            options=["Standard", "High"],
+            value="High",
+            help="High quality produces a larger PowerPoint file."
+        )
 
     if uploaded_pdf is not None:
         st.info(f"Selected: {uploaded_pdf.name}")
@@ -694,7 +775,10 @@ elif menu == "PDF to PowerPoint":
             try:
                 with st.spinner("Converting PDF pages to slides..."):
                     scale = 1.5 if quality == "Standard" else 2.5
-                    ppt_buffer = convert_pdf_to_ppt(uploaded_pdf.getvalue(), scale)
+                    editable = conversion_mode == "Editable objects"
+                    ppt_buffer = convert_pdf_to_ppt(
+                        uploaded_pdf.getvalue(), editable=editable, render_scale=scale
+                    )
 
                 output_name = re.sub(r"(?i)\.pdf$", "", uploaded_pdf.name) + ".pptx"
                 st.success("Conversion completed successfully.")
